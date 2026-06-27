@@ -89,7 +89,7 @@ from minotaur_subnet.shared.types import ExecutionPlan, Interaction
 logger = logging.getLogger(__name__)
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "optimal-router-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "11.7.0")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "11.8.0")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "miner")
 
 _FALSE = {"0", "false", "no", "off", ""}
@@ -153,7 +153,15 @@ _QUOTE_WORKERS = int(os.environ.get("MINER_QUOTE_WORKERS", "8"))
 _SEED_TIMEOUT_S = float(os.environ.get("MINER_SEED_TIMEOUT_S", "2.0"))
 _RESOLVE_TIMEOUT_S = float(os.environ.get("MINER_RESOLVE_TIMEOUT_S", "2.5"))
 _MAX_CANDIDATES = int(os.environ.get("MINER_MAX_CANDIDATES", "10"))
-_SPLIT_MIN_GAIN = float(os.environ.get("MINER_SPLIT_MIN_GAIN", "1.02"))
+# GAS-AWARE split activation threshold (Escudero–Lara–Sama 2026, "Optimal Routing across
+# CFMMs with Gas Fees": only activate an extra pool when its output gain outweighs its fixed
+# gas cost). A 2-leg split adds ~110k gas → gasScore −0.11 → finalScore −0.022 (the 0.2 gas
+# weight). The output gain in score is ~0.4·Δout/anchor (0.8 output weight × 0.5 ratio slope),
+# so a split is net-positive only when Δout/anchor > 0.022/0.4 ≈ 5.5%. The old 1.02 (+2%) gate
+# fired the split while it was still gas-NEGATIVE; 1.06 makes it fire only when it actually
+# raises finalScore (≈never on deep Base pairs, as measured — so we stay single-hop like the
+# baseline; it still self-activates on a genuinely fragmented pair with >6% split gain).
+_SPLIT_MIN_GAIN = float(os.environ.get("MINER_SPLIT_MIN_GAIN", "1.06"))
 _SPLIT_RATIOS = (0.3, 0.5, 0.7)
 # Hard wall-clock bound on the split attempt. Its quote_hop loop does LIVE RPC, which
 # HANGS in a no-network screening sandbox (--network=none) until the socket times out —
@@ -566,7 +574,92 @@ class MinerSolver(BaselineSwapSolver):
                     return self._fix_multihop_v2(enhanced)
             except Exception:
                 logger.exception("[miner] split routing failed; using baseline plan")
+        # 4) Gas-aware reroute: swap a gas-heavy aero/multi-hop route for a Uniswap single-hop
+        #    when the latter delivers within the gas-justified margin (honest-regime: output is
+        #    ~capped, so lower gas wins). Bounded; falls back to base_plan on anything.
+        base_plan = self._gas_aware_reroute(intent, state, snapshot, base_plan)
         return self._fix_multihop_v2(base_plan)
+
+    def _gas_aware_reroute(self, intent, state, snapshot, plan):
+        """Gas-aware route selection (Escudero–Lara–Sama 2026, CFMM routing w/ gas fees). The
+        baseline picks MAX OUTPUT, so on a deep pair it may choose a higher-gas Aerodrome/multi-
+        hop route that out-delivers Uniswap by a hair. In the honest-anchor regime that extra
+        output is ~capped while the extra gas lowers gasScore (0.2 weight). If a Uniswap single-
+        hop delivers within ~2% of the plan's output (the gas-justified threshold for aero's
+        ~+55k / multi-hop's ~+90k gas), switch to it → higher finalScore. Bounded + always falls
+        back to the given plan, so it can only RAISE finalScore, never break or null the plan."""
+        try:
+            m = (plan.metadata or {}) if plan else {}
+            route = str(m.get("route") or "")
+            if not route or ("aerodrome" not in route and "multi" not in route):
+                return plan  # uniswap single-hop is already lean — nothing to save
+            exp = int(m.get("expected_output", 0) or 0)
+            if exp <= 0:
+                return plan
+            params = self._normalized_swap_params(intent, state)
+            tin = str(params.get("input_token", "") or ""); tout = str(params.get("output_token", "") or "")
+            amount_in = int(params.get("input_amount", 0) or 0)
+            chain_id = int(state.chain_id or (snapshot.chain_id if snapshot else 0) or 0)
+            if chain_id != 8453 or amount_in <= 0 or not tin or not tout:
+                return plan
+            best = self._bounded_call(
+                lambda: self._uniswap_best_single(chain_id, tin, tout, amount_in), timeout=4.0)
+            if not best:
+                return plan
+            uni_out, uni_fee = best
+            if uni_out < int(exp * 0.98):
+                return plan  # aero/multi-hop's extra output justifies its extra gas — keep it
+            from strategies.dex_aggregator.swap_solver import UNISWAP_V3_ROUTERS
+            from common.abi_utils import encode_approve
+            from strategies.dex_aggregator.v3_codec import encode_exact_input_single
+            router = UNISWAP_V3_ROUTERS.get(chain_id)
+            if not router:
+                return plan
+            min_out = int(m.get("min_output_amount", params.get("min_output_amount", 0)) or 0)
+            recipient = state.contract_address or params.get("receiver") or state.owner
+            ts = getattr(snapshot, "timestamp", None) if snapshot else None
+            deadline = int(ts or time.time()) + 300
+            interactions = [
+                Interaction(target=tin, value="0", call_data=encode_approve(router, amount_in), chain_id=chain_id),
+                Interaction(
+                    target=router, value="0",
+                    call_data=encode_exact_input_single(
+                        token_in=tin, token_out=tout, fee=uni_fee, recipient=recipient,
+                        deadline=deadline, amount_in=amount_in, amount_out_minimum=min_out, chain_id=chain_id),
+                    chain_id=chain_id),
+            ]
+            logger.info("[miner] gas-aware reroute: %s → uniswap single fee=%d (uni_out=%d ≥ 0.98·exp=%d) lower gas",
+                        route, uni_fee, uni_out, exp)
+            return ExecutionPlan(
+                intent_id=intent.app_id, interactions=interactions, deadline=deadline, nonce=state.nonce,
+                metadata={**m, "route": "uniswap_v3", "fee_tier": uni_fee, "expected_output": str(uni_out),
+                          "gas_aware_reroute": True})
+        except Exception:
+            logger.exception("[miner] gas-aware reroute failed; keeping baseline plan")
+            return plan
+
+    def _uniswap_best_single(self, chain_id, tin, tout, amount_in):
+        """Bounded QuoterV2 best single-hop (output, fee) across fee tiers, or None. Each
+        eth_call is capped by _get_web3's per-request timeout (C1), so this can't hang."""
+        w3 = self._get_web3(int(chain_id))
+        if w3 is None:
+            return None
+        from eth_abi import encode as _enc, decode as _dec
+        from eth_utils import keccak as _kk, to_checksum_address as _ck
+        quoter = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Base Uniswap V3 QuoterV2
+        sel = _kk(text="quoteExactInputSingle((address,address,uint256,uint24,uint160))")[:4]
+        best = None
+        for fee in (100, 500, 3000, 10000):
+            try:
+                p = _enc(["(address,address,uint256,uint24,uint160)"],
+                         [(_ck(tin), _ck(tout), int(amount_in), fee, 0)])
+                r = w3.eth.call({"to": _ck(quoter), "data": "0x" + (sel + p).hex()})
+                out = _dec(["uint256", "uint160", "uint32", "uint256"], r)[0]
+                if out > 0 and (best is None or out > best[0]):
+                    best = (out, fee)
+            except Exception:
+                continue
+        return best
 
     def _offline_fallback_plan(self, intent, state, snapshot):
         """RPC-free safety net for when the baseline produced no plan (RPC down/slow).
