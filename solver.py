@@ -89,7 +89,7 @@ from minotaur_subnet.shared.types import ExecutionPlan, Interaction
 logger = logging.getLogger(__name__)
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "optimal-router-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "11.9.0")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "11.10.0")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "miner")
 
 _FALSE = {"0", "false", "no", "off", ""}
@@ -594,7 +594,18 @@ class MinerSolver(BaselineSwapSolver):
         #    when the latter delivers within the gas-justified margin (honest-regime: output is
         #    ~capped, so lower gas wins). Bounded; falls back to base_plan on anything.
         base_plan = self._gas_aware_reroute(intent, state, snapshot, base_plan)
-        return self._fix_multihop_v2(base_plan)
+        final_plan = self._fix_multihop_v2(base_plan)
+        # 5) NEVER-NULL GUARANTEE: a None plan is a Stage-3 null-plan REJECTION (whole submission
+        #    rejected, worse than a per-case 0). If the baseline + offline fallback both yielded
+        #    nothing, return a structurally-valid empty plan so the case scores 0 at worst and the
+        #    submission still screens + scores every OTHER case.
+        if final_plan is None:
+            logger.warning("[miner] no plan from baseline/fallback — emitting empty plan (avoid null-plan reject)")
+            final_plan = ExecutionPlan(
+                intent_id=getattr(intent, "app_id", "") or "", interactions=[],
+                deadline=int(time.time()) + 300, nonce=int(getattr(state, "nonce", 0) or 0),
+                metadata={"route": "last_resort_empty"})
+        return final_plan
 
     def _prefer_low_gas_route(self, max_out, max_gas, cheap_out, cheap_gas):
         """Score-based route choice — King buys MAX OUTPUT, we buy MAX SCORE. Prefer the
@@ -641,6 +652,13 @@ class MinerSolver(BaselineSwapSolver):
             if not best:
                 return plan
             uni_out, uni_fee = best
+            min_out = int(m.get("min_output_amount", params.get("min_output_amount", 0)) or 0)
+            # #5 REVERT GUARD: never switch to a route that can't clear the order min — a uniswap
+            # swap delivering below min reverts (CallFailed "Too little received") / the scorer
+            # hard-zeros delivered<min. Keep the richer route. (Self-quote regime min is low →
+            # this rarely blocks; honest/historical min can be tight → this prevents a win→0.)
+            if min_out > 0 and uni_out <= min_out:
+                return plan
             # MAX-SCORE switch: only when the gas saved (cur_gas → uniswap single) funds the
             # output give-up. Fixes the cbBTC→WETH multi-hop leak the flat 98% gate missed.
             if not self._prefer_low_gas_route(exp, cur_gas, uni_out, _GAS_UNISWAP_SINGLE):
@@ -651,7 +669,6 @@ class MinerSolver(BaselineSwapSolver):
             router = UNISWAP_V3_ROUTERS.get(chain_id)
             if not router:
                 return plan
-            min_out = int(m.get("min_output_amount", params.get("min_output_amount", 0)) or 0)
             recipient = state.contract_address or params.get("receiver") or state.owner
             ts = getattr(snapshot, "timestamp", None) if snapshot else None
             deadline = int(ts or time.time()) + 300
