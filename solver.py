@@ -89,7 +89,7 @@ from minotaur_subnet.shared.types import ExecutionPlan, Interaction
 logger = logging.getLogger(__name__)
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "optimal-router-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "11.8.0")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "11.9.0")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "miner")
 
 _FALSE = {"0", "false", "no", "off", ""}
@@ -163,6 +163,22 @@ _MAX_CANDIDATES = int(os.environ.get("MINER_MAX_CANDIDATES", "10"))
 # baseline; it still self-activates on a genuinely fragmented pair with >6% split gain).
 _SPLIT_MIN_GAIN = float(os.environ.get("MINER_SPLIT_MIN_GAIN", "1.06"))
 _SPLIT_RATIOS = (0.3, 0.5, 0.7)
+
+# ── Gas-aware route choice (the edge over king) ───────────────────────────────
+# King buys MAX OUTPUT (QuoterV2 amountOut, no overrides → often Aerodrome/multi-hop,
+# high gas). We buy MAX SCORE: when a leaner Uniswap single-hop delivers ~the same
+# output, take it and bank the gasScore (0.2 weight). Per-route gas estimates (Base,
+# measured): uniswap single-hop ~165k, aerodrome single ~220k, uniswap 2-hop ~256k.
+_GAS_UNISWAP_SINGLE = int(os.environ.get("MINER_GAS_UNISWAP_SINGLE", "165000"))
+_GAS_AERODROME = int(os.environ.get("MINER_GAS_AERODROME", "220000"))
+_GAS_MULTIHOP = int(os.environ.get("MINER_GAS_MULTIHOP", "256000"))
+# Switch to the cheaper route only when the gasScore GAIN (0.2 weight) outweighs the
+# worst-case outputScore LOSS (0.8 weight, slope ≤0.5/anchor): net-positive ⇔
+# (1-retention) ≤ 0.5·gas_saved/1e6. So aero's ~55k funds ~2.7% output give-up; a
+# multi-hop's ~91k funds ~4.5% — which is exactly why a flat 98% gate LEFT the
+# cbBTC→WETH multi-hop loss on the table (king took the lean single-hop, we didn't).
+_REROUTE_MIN_GAS_SAVED = int(os.environ.get("MINER_REROUTE_MIN_GAS_SAVED", "30000"))
+_REROUTE_SAFETY_FLOOR = float(os.environ.get("MINER_REROUTE_SAFETY_FLOOR", "0.94"))  # never give up >6% output
 # Hard wall-clock bound on the split attempt. Its quote_hop loop does LIVE RPC, which
 # HANGS in a no-network screening sandbox (--network=none) until the socket times out —
 # blowing the 30s/plan budget before the offline baseline is reached → null plan → Stage-3
@@ -580,22 +596,40 @@ class MinerSolver(BaselineSwapSolver):
         base_plan = self._gas_aware_reroute(intent, state, snapshot, base_plan)
         return self._fix_multihop_v2(base_plan)
 
+    def _prefer_low_gas_route(self, max_out, max_gas, cheap_out, cheap_gas):
+        """Score-based route choice — King buys MAX OUTPUT, we buy MAX SCORE. Prefer the
+        cheaper-gas route iff its gasScore GAIN (0.2 weight) outweighs the worst-case
+        outputScore LOSS (0.8 weight, slope ≤0.5/anchor): net-positive ⇔
+        (1-retention) ≤ 0.5·gas_saved/1e6. A hard SAFETY_FLOOR caps the max output give-up
+        regardless of gas, and a MIN_GAS_SAVED gate skips negligible savings."""
+        if max_out <= 0 or cheap_out <= 0:
+            return False
+        gas_saved = int(max_gas) - int(cheap_gas)
+        if gas_saved < _REROUTE_MIN_GAS_SAVED:
+            return False
+        retention = cheap_out / max_out
+        if retention < _REROUTE_SAFETY_FLOOR:
+            return False  # never sacrifice more output than the safety cap, whatever the gas
+        return (1.0 - retention) <= 0.5 * gas_saved / 1e6
+
     def _gas_aware_reroute(self, intent, state, snapshot, plan):
-        """Gas-aware route selection (Escudero–Lara–Sama 2026, CFMM routing w/ gas fees). The
-        baseline picks MAX OUTPUT, so on a deep pair it may choose a higher-gas Aerodrome/multi-
-        hop route that out-delivers Uniswap by a hair. In the honest-anchor regime that extra
-        output is ~capped while the extra gas lowers gasScore (0.2 weight). If a Uniswap single-
-        hop delivers within ~2% of the plan's output (the gas-justified threshold for aero's
-        ~+55k / multi-hop's ~+90k gas), switch to it → higher finalScore. Bounded + always falls
-        back to the given plan, so it can only RAISE finalScore, never break or null the plan."""
+        """Gas-aware route selection (Escudero–Lara–Sama 2026, CFMM routing w/ gas fees). King's
+        baseline picks MAX OUTPUT, so it often takes a higher-gas Aerodrome/multi-hop route that
+        out-delivers a lean Uniswap single-hop by a hair. We instead pick MAX SCORE: when a
+        Uniswap single-hop's output retention clears the GAS-JUSTIFIED floor (``_prefer_low_gas_route``
+        — aero's ~55k funds ~2.7% give-up, a 2-hop's ~91k funds ~4.5%), switch to it → higher
+        finalScore. This is the whole edge over king. Bounded + always falls back to the given
+        plan, so it can only RAISE finalScore, never break or null the plan."""
         try:
             m = (plan.metadata or {}) if plan else {}
             route = str(m.get("route") or "")
-            if not route or ("aerodrome" not in route and "multi" not in route):
+            rl = route.lower()
+            if not route or ("aerodrome" not in rl and "multi" not in rl):
                 return plan  # uniswap single-hop is already lean — nothing to save
             exp = int(m.get("expected_output", 0) or 0)
             if exp <= 0:
                 return plan
+            cur_gas = _GAS_MULTIHOP if "multi" in rl else (_GAS_AERODROME if "aero" in rl else _GAS_UNISWAP_SINGLE)
             params = self._normalized_swap_params(intent, state)
             tin = str(params.get("input_token", "") or ""); tout = str(params.get("output_token", "") or "")
             amount_in = int(params.get("input_amount", 0) or 0)
@@ -607,8 +641,10 @@ class MinerSolver(BaselineSwapSolver):
             if not best:
                 return plan
             uni_out, uni_fee = best
-            if uni_out < int(exp * 0.98):
-                return plan  # aero/multi-hop's extra output justifies its extra gas — keep it
+            # MAX-SCORE switch: only when the gas saved (cur_gas → uniswap single) funds the
+            # output give-up. Fixes the cbBTC→WETH multi-hop leak the flat 98% gate missed.
+            if not self._prefer_low_gas_route(exp, cur_gas, uni_out, _GAS_UNISWAP_SINGLE):
+                return plan  # the richer route's extra output justifies its extra gas — keep it
             from strategies.dex_aggregator.swap_solver import UNISWAP_V3_ROUTERS
             from common.abi_utils import encode_approve
             from strategies.dex_aggregator.v3_codec import encode_exact_input_single
@@ -628,8 +664,9 @@ class MinerSolver(BaselineSwapSolver):
                         deadline=deadline, amount_in=amount_in, amount_out_minimum=min_out, chain_id=chain_id),
                     chain_id=chain_id),
             ]
-            logger.info("[miner] gas-aware reroute: %s → uniswap single fee=%d (uni_out=%d ≥ 0.98·exp=%d) lower gas",
-                        route, uni_fee, uni_out, exp)
+            logger.info("[miner] gas-aware reroute: %s(~%dk gas) → uniswap single fee=%d (uni_out=%d vs exp=%d, "
+                        "retention=%.4f gas-justified) → +gasScore", route, cur_gas // 1000, uni_fee, uni_out, exp,
+                        (uni_out / exp) if exp else 0.0)
             return ExecutionPlan(
                 intent_id=intent.app_id, interactions=interactions, deadline=deadline, nonce=state.nonce,
                 metadata={**m, "route": "uniswap_v3", "fee_tier": uni_fee, "expected_output": str(uni_out),
